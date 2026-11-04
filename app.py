@@ -6,19 +6,20 @@ import openpyxl
 import base64
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho - Đồng Bộ GitHub", layout="wide")
+st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho - Quản Lý Kho", layout="wide")
 
 DEFAULT_DATA_FILE = "latest_inventory_list.xlsx"
 
-st.title("📋 HỆ THỐNG KIỂM KÊ KHO - ĐỒNG BỘ 24/7 TRÊN CLOUD")
+st.title("📋 HỆ THỐNG KIỂM KÊ KHO - QUẢN LÝ THEO TÊN & NHÓM")
 st.markdown("---")
 
 if 'header_line' not in st.session_state:
     st.session_state['header_line'] = 4
 
 def save_to_github():
-    """Hàm tự động đẩy file Excel lên GitHub qua API để lưu vĩnh viễn"""
+    """Hàm tự động đẩy file Excel lên GitHub qua API để lưu vĩnh viễn 24/7"""
     try:
         if "GITHUB_TOKEN" in st.secrets and "REPO_NAME" in st.secrets:
             token = st.secrets["GITHUB_TOKEN"]
@@ -64,27 +65,26 @@ def save_updates_to_excel_file():
                         if val:
                             col_map[str(val).strip()] = col_idx
                     
-                    for needed_col in ['SLKK', 'Cập nhật bởi (IP)', 'Thời gian sửa']:
+                    # Đổi tên cột IP thành Người cập nhật cho phù hợp thực tế
+                    for needed_col in ['SLKK', 'Người cập nhật', 'Thời gian sửa']:
                         if needed_col not in col_map:
                             new_col_idx = ws.max_column + 1
                             ws.cell(row=header_row_num, column=new_col_idx, value=needed_col)
                             col_map[needed_col] = new_col_idx
 
                     slkk_col = col_map.get('SLKK')
-                    ip_col = col_map.get('Cập nhật bởi (IP)')
+                    user_col = col_map.get('Người cập nhật')
                     time_col = col_map.get('Thời gian sửa')
 
                     for r_idx, row in df_val.iterrows():
                         excel_row_num = header_row_num + 1 + r_idx
                         if slkk_col:
                             ws.cell(row=excel_row_num, column=slkk_col, value=row.get('SLKK'))
-                        if ip_col:
-                            ws.cell(row=excel_row_num, column=ip_col, value=row.get('Cập nhật bởi (IP)'))
+                        if user_col:
+                            ws.cell(row=excel_row_num, column=user_col, value=row.get('Người cập nhật'))
                         if time_col:
                             ws.cell(row=excel_row_num, column=time_col, value=row.get('Thời gian sửa'))
             wb.save(DEFAULT_DATA_FILE)
-            
-            # Tự động đồng bộ lên GitHub sau khi lưu cục bộ thành công
             save_to_github()
         except Exception as e:
             with pd.ExcelWriter(DEFAULT_DATA_FILE, engine='openpyxl') as writer:
@@ -93,17 +93,13 @@ def save_updates_to_excel_file():
             save_to_github()
 
 with st.sidebar:
-    st.header("🔐 XÁC THỰC NGƯỜI DÙNG")
-    try:
-        if hasattr(st, "context") and hasattr(st.context, "headers"):
-            client_ip = st.context.headers.get("X-Forwarded-For", "Cloud User")
-        else:
-            client_ip = "Streamlit Cloud / Local"
-    except Exception:
-        client_ip = "Không xác định"
+    st.header("👤 THÔNG TIN NGƯỜI DÙNG")
+    # Nhập tên 1 lần duy nhất ở đây
+    input_user_name = st.text_input("Nhập họ tên của bạn:", value=st.session_state.get('user_name', ''), placeholder="VD: Nguyễn Thị Trang")
+    st.session_state['user_name'] = input_user_name
 
-    st.info(f"🌐 Trạng thái kết nối:\n`Hoạt động ổn định`")
-
+    st.markdown("---")
+    st.header("🔐 XÁC THỰC QUẢN TRỊ")
     user_role = st.selectbox("Chọn vai trò:", ["Nhân viên kho (Chỉ nhập SLKK)", "Quản trị viên (Admin)"])
     admin_password = st.text_input("Mật khẩu Admin:", type="password") if user_role == "Quản trị viên (Admin)" else ""
 
@@ -130,13 +126,13 @@ with st.sidebar:
                     df_s = df_s.loc[:, ~df_s.columns.astype(str).str.contains('^Unnamed')]
 
                     if 'SLKK' not in df_s.columns: df_s['SLKK'] = None
-                    if 'Cập nhật bởi (IP)' not in df_s.columns: df_s['Cập nhật bởi (IP)'] = ""
+                    if 'Người cập nhật' not in df_s.columns: df_s['Người cập nhật'] = ""
                     if 'Thời gian sửa' not in df_s.columns: df_s['Thời gian sửa'] = ""
                     new_sheets[s_name] = df_s
 
                 st.session_state['sheets_data'] = new_sheets
-                save_to_github() # Đồng bộ file mới lên GitHub
-                st.success("✅ Tải và cập nhật list mới thành công trên Cloud!")
+                save_to_github()
+                st.success("✅ Tải và cập nhật list mới thành công!")
             except Exception as e:
                 st.error(f"Lỗi đọc file: {e}")
         else:
@@ -154,7 +150,7 @@ if 'sheets_data' not in st.session_state:
                 df_s = df_s.loc[:, ~df_s.columns.astype(str).str.contains('^Unnamed')]
 
                 if 'SLKK' not in df_s.columns: df_s['SLKK'] = None
-                if 'Cập nhật bởi (IP)' not in df_s.columns: df_s['Cập nhật bởi (IP)'] = ""
+                if 'Người cập nhật' not in df_s.columns: df_s['Người cập nhật'] = ""
                 if 'Thời gian sửa' not in df_s.columns: df_s['Thời gian sửa'] = ""
                 st.session_state['sheets_data'][s_name] = df_s
         except Exception:
@@ -166,7 +162,7 @@ if not st.session_state['sheets_data']:
     st.warning("⚠️ Chưa có dữ liệu trong hệ thống. Quản trị viên hãy đăng nhập Admin (Mật khẩu: `123456`) và tải file Excel lên ở thanh bên trái!")
 else:
     if user_role == "Nhân viên kho (Chỉ nhập SLKK)":
-        st.info("💡 **Hướng dẫn:** Chọn nhóm/sheet ở bên dưới, nhập số lượng vào cột **SLKK**, sau đó bấm nút **💾 LƯU TẤT CẢ THAY ĐỔI**.")
+        st.info("💡 **Hướng dẫn:** Nhập họ tên ở thanh bên trái -> Chọn nhóm/sheet -> Nhập số lượng vào cột **SLKK** -> Bấm nút **💾 LƯU TẤT CẢ THAY ĐỔI**.")
     else:
         st.success("👑 Bạn đang ở chế độ **Quản trị viên (Admin)**: Toàn quyền chỉnh sửa dữ liệu.")
 
@@ -176,7 +172,7 @@ else:
 
     current_df = st.session_state['sheets_data'][selected_sheet].copy()
 
-    # Ô LỌC TRỰC TIẾP TỨC THÌ (GÕ ĐẾN ĐÂU HIỆN ĐẾN ĐÓ)
+    # Ô LỌC TRỰC TIẾP TỨC THÌ
     col_f1, col_f2 = st.columns(2)
     with col_f1:
         s_loc = st.text_input("🔍 Lọc trực tiếp theo Location:", placeholder="Nhập ký tự location...", key="filter_loc")
@@ -203,29 +199,34 @@ else:
         submitted = st.form_submit_button(f"💾 LƯU TẤT CẢ THAY ĐỔI (CHO NHÓM: {selected_sheet})", type="primary", use_container_width=True)
 
     if submitted:
-        now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        orig_df = st.session_state['sheets_data'][selected_sheet]
-        has_changes = False
-
-        for _, row in edited_df.iterrows():
-            loc = str(row.get('location', '')).strip()
-            mat = str(row.get('material_no', '')).strip()
-            new_slkk = row.get('SLKK')
-
-            match_mask = (orig_df['location'].astype(str).str.strip() == loc) & (orig_df['material_no'].astype(str).str.strip() == mat)
-            if match_mask.any():
-                old_val = orig_df.loc[match_mask, 'SLKK'].values[0]
-                if str(old_val) != str(new_slkk) and pd.notna(new_slkk):
-                    orig_df.loc[match_mask, 'SLKK'] = new_slkk
-                    orig_df.loc[match_mask, 'Cập nhật bởi (IP)'] = client_ip
-                    orig_df.loc[match_mask, 'Thời gian sửa'] = now_time
-                    has_changes = True
-
-        if has_changes:
-            save_updates_to_excel_file()
-            st.success(f"🎉 Đã lưu và đồng bộ thay đổi cho nhóm [{selected_sheet}] lên GitHub thành công!")
+        current_name = st.session_state.get('user_name', '').strip()
+        if not current_name:
+            st.warning("⚠️ Vui lòng nhập **Họ tên của bạn** ở thanh bên trái trước khi lưu thay đổi!")
         else:
-            st.info("ℹ️ Không có thay đổi mới nào được ghi nhận.")
+            # Lấy chuẩn giờ Việt Nam (GMT+7)
+            now_time = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d %H:%M:%S")
+            orig_df = st.session_state['sheets_data'][selected_sheet]
+            has_changes = False
+
+            for _, row in edited_df.iterrows():
+                loc = str(row.get('location', '')).strip()
+                mat = str(row.get('material_no', '')).strip()
+                new_slkk = row.get('SLKK')
+
+                match_mask = (orig_df['location'].astype(str).str.strip() == loc) & (orig_df['material_no'].astype(str).str.strip() == mat)
+                if match_mask.any():
+                    old_val = orig_df.loc[match_mask, 'SLKK'].values[0]
+                    if str(old_val) != str(new_slkk) and pd.notna(new_slkk):
+                        orig_df.loc[match_mask, 'SLKK'] = new_slkk
+                        orig_df.loc[match_mask, 'Người cập nhật'] = current_name
+                        orig_df.loc[match_mask, 'Thời gian sửa'] = now_time
+                        has_changes = True
+
+            if has_changes:
+                save_updates_to_excel_file()
+                st.success(f"🎉 Đã lưu và đồng bộ thay đổi của **{current_name}** lên hệ thống thành công!")
+            else:
+                st.info("ℹ️ Không có thay đổi mới nào được ghi nhận.")
 
     st.markdown("---")
     st.subheader("💾 TẢI XUỐNG KẾT QUẢ")
@@ -234,7 +235,7 @@ else:
         for s_name, df_val in st.session_state['sheets_data'].items():
             df_val.to_excel(writer, index=False, sheet_name=s_name)
     st.download_button(
-        label="📥 Tải file Excel hoàn chỉnh (Kèm lịch sử IP)",
+        label="📥 Tải file Excel hoàn chỉnh (Kèm lịch sử người sửa)",
         data=output.getvalue(),
         file_name="KetQua_KiemKe_Audit.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
