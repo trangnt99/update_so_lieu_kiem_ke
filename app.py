@@ -17,6 +17,7 @@ st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho", layout="wide")
 
 DB_FILE = "inventory.db"
 GH_PATH = "inventory.db"
+EXCEL_FILE = "KK_List.xlsx"  # Tên file Excel mẫu của bạn trên GitHub
 META_COLS = ["Người cập nhật", "Cập nhật bởi (IP)", "Thời gian sửa"]
 SECTION_NAMES = ["Xuất khẩu", "HBM", "Nội địa", "Vật tư giao thẳng"]
 
@@ -136,11 +137,57 @@ def backup_to_github():
             os.remove(tmp)
 
 
+def load_excel_from_github_to_db(header_idx=3):
+    """Tự động tải file Excel mẫu trực tiếp từ GitHub vào DB"""
+    cfg = gh_conf()
+    if not cfg:
+        return
+    token, repo = cfg
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/contents/{EXCEL_FILE}",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.raw",
+            },
+            timeout=60,
+        )
+        if r.status_code == 200 and r.content:
+            raw = pd.read_excel(io.BytesIO(r.content), sheet_name=None, header=header_idx, dtype=str)
+            with db() as c:
+                # Kiểm tra xem DB đã có dữ liệu chưa, nếu chưa có thì nạp mới
+                count = c.execute("SELECT COUNT(*) FROM sheets").fetchone()[0]
+                if count == 0:
+                    for pos, (name, df) in enumerate(raw.items()):
+                        df = df.dropna(how="all").dropna(axis=1, how="all")
+                        df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")]
+                        df.columns = [str(x).strip() for x in df.columns]
+                        slkk = (
+                            pd.to_numeric(df["SLKK"], errors="coerce")
+                            if "SLKK" in df.columns
+                            else pd.Series([None] * len(df), index=df.index, dtype="float")
+                        )
+                        df = df.drop(columns=[x for x in ["SLKK"] + META_COLS if x in df.columns])
+                        df = df.astype(object).where(df.notna(), None)
+                        c.execute(
+                            "INSERT OR IGNORE INTO sheets(name, cols, pos) VALUES (?,?,?)",
+                            (name, json.dumps(list(df.columns), ensure_ascii=False), pos),
+                        )
+                        rows = [
+                            (name, json.dumps(rec, ensure_ascii=False), None if pd.isna(s) else float(s))
+                            for rec, s in zip(df.to_dict("records"), slkk)
+                        ]
+                        c.executemany("INSERT INTO items(sheet, data, slkk) VALUES (?,?,?)", rows)
+    except Exception as e:
+        print(f"Lỗi load excel từ GitHub: {e}")
+
+
 @st.cache_resource
 def init_app():
     if not os.path.exists(DB_FILE):
         restore_from_github()
     init_db()
+    load_excel_from_github_to_db(header_idx=3)  # Mặc định dòng 4 là header (index 3)
     return True
 
 
@@ -157,7 +204,6 @@ def get_section_name(sheet_name):
 
 
 def get_nhom_name(sheet_name):
-    """Lấy tên nhóm là phần trước dấu '-' trên sheet (ví dụ 'dầu mỡ-985Y' -> 'dầu mỡ')"""
     if "-" in sheet_name:
         return sheet_name.split("-")[0].strip()
     return sheet_name.strip()
@@ -179,33 +225,6 @@ def get_client_ip():
         return "Không xác định"
 
 
-def import_excel(file_bytes, header_idx):
-    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=header_idx, dtype=str)
-    with db() as c:
-        c.execute("DELETE FROM sheets")
-        c.execute("DELETE FROM items")
-        for pos, (name, df) in enumerate(raw.items()):
-            df = df.dropna(how="all").dropna(axis=1, how="all")
-            df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")]
-            df.columns = [str(x).strip() for x in df.columns]
-            slkk = (
-                pd.to_numeric(df["SLKK"], errors="coerce")
-                if "SLKK" in df.columns
-                else pd.Series([None] * len(df), index=df.index, dtype="float")
-            )
-            df = df.drop(columns=[x for x in ["SLKK"] + META_COLS if x in df.columns])
-            df = df.astype(object).where(df.notna(), None)
-            c.execute(
-                "INSERT INTO sheets(name, cols, pos) VALUES (?,?,?)",
-                (name, json.dumps(list(df.columns), ensure_ascii=False), pos),
-            )
-            rows = [
-                (name, json.dumps(rec, ensure_ascii=False), None if pd.isna(s) else float(s))
-                for rec, s in zip(df.to_dict("records"), slkk)
-            ]
-            c.executemany("INSERT INTO items(sheet, data, slkk) VALUES (?,?,?)", rows)
-
-
 def list_sheets():
     with db() as c:
         return [r["name"] for r in c.execute("SELECT name FROM sheets ORDER BY pos")]
@@ -213,7 +232,10 @@ def list_sheets():
 
 def load_df(sheet):
     with db() as c:
-        cols = json.loads(c.execute("SELECT cols FROM sheets WHERE name=?", (sheet,)).fetchone()["cols"])
+        row_sheet = c.execute("SELECT cols FROM sheets WHERE name=?", (sheet,)).fetchone()
+        if not row_sheet:
+            return pd.DataFrame(), []
+        cols = json.loads(row_sheet["cols"])
         rows = c.execute(
             "SELECT id, data, slkk, updated_by, ip, updated_at FROM items WHERE sheet=? ORDER BY id",
             (sheet,),
@@ -311,20 +333,16 @@ with st.sidebar:
 
     if is_admin:
         st.markdown("---")
-        st.header("⚙️ QUẢN LÝ DỮ LIỆU")
-        header_line = st.number_input("Dòng chứa tiêu đề (Header row):", min_value=1, value=4, step=1)
-        up = st.file_uploader("📂 Tải list kiểm kê mới (Excel):", type=["xlsx", "xls"])
-        confirm = st.checkbox("Tôi hiểu: áp dụng file mới sẽ thay toàn bộ dữ liệu hiện tại")
-        if st.button("✅ Áp dụng file này", disabled=not (up and confirm)):
-            try:
-                import_excel(up.getvalue(), header_line - 1)
-                ok, msg = backup_to_github()
-                st.session_state["ver"] += 1
-                st.success("Đã nạp list mới." + ("" if ok else f" (Chưa sao lưu GitHub: {msg})"))
-            except Exception as e:
-                st.error(f"Lỗi đọc file: {e}")
+        st.header("⚙️ QUẢN LÝ HỆ THỐNG")
+        if st.button("🔄 Nạp lại dữ liệu từ file Excel gốc"):
+            if os.path.exists(DB_FILE):
+                os.remove(DB_FILE)
+            init_app()
+            st.session_state["ver"] += 1
+            st.success("Đã làm mới dữ liệu từ file KK_List.xlsx trên GitHub!")
+            st.rerun()
 
-        if st.button("☁️ Sao lưu lên GitHub ngay"):
+        if st.button("☁️ Sao lưu dữ liệu lên GitHub ngay"):
             ok, msg = backup_to_github()
             st.success("Đã sao lưu.") if ok else st.error(msg)
 
@@ -334,16 +352,14 @@ with st.sidebar:
 
 sheets = list_sheets()
 if not sheets:
-    st.warning("⚠️ Chưa có dữ liệu. Quản trị viên hãy đăng nhập Admin và tải file Excel lên ở thanh bên trái.")
+    st.warning("⚠️ Chưa có dữ liệu. Hãy đảm bảo file `KK_List.xlsx` đã được tải lên kho lưu trữ GitHub của bạn.")
     st.stop()
 
 if is_admin:
     st.success("👑 Chế độ **Quản trị viên**: được sửa tất cả các cột dữ liệu.")
 else:
-    st.info("💡 Nhập họ tên (thanh bên trái) → chọn Section Name → Nhóm → nhập **SLKK** → bấm **LƯU**. "
-            "Hãy lưu trước khi đổi bộ lọc, vì đổi bộ lọc sẽ làm mới bảng.")
+    st.info("💡 Nhập họ tên (thanh bên trái) → chọn Section Name → Nhóm → nhập **SLKK** → bấm **LƯU**.")
 
-# Xây dựng cấu trúc phân cấp: Section Name -> Nhóm (tên trước dấu '-') -> Danh sách sheet chi tiết
 section_map = {sec: {} for sec in SECTION_NAMES}
 for s in sheets:
     sec = get_section_name(s)
@@ -362,7 +378,6 @@ with c2:
     nhom_choice = st.selectbox("📋 Nhóm:", available_nhoms)
 with c3:
     sheet_choices = section_map[section_name][nhom_choice]
-    # Nếu nhóm có nhiều sheet chi tiết (khác tên), cho chọn sheet cụ thể; nếu chỉ có 1 sheet thì tự động lấy luôn
     if len(sheet_choices) > 1:
         sheet = st.selectbox("📌 Sheet chi tiết:", sheet_choices)
     else:
@@ -409,11 +424,11 @@ if submitted:
         if changed:
             ok, msg = backup_to_github()
             st.session_state["ver"] += 1
-            st.success(f"🎉 Đã lưu {changed} dòng của **{user_name}**.")
+            st.success(f"🎉 Đã lưu {changed} dòng của **{user_name}** lên hệ thống & GitHub thành công!")
             if conflicts:
-                st.warning(f"⚠️ {conflicts} dòng đã được người khác sửa trong lúc bạn nhập; giá trị của bạn đã ghi đè.")
+                st.warning(f"⚠️ {conflicts} dòng đã được người khác sửa trong lúc bạn nhập.")
             if not ok:
-                st.warning(f"Đã lưu trên server nhưng chưa sao lưu được lên GitHub: {msg}")
+                st.warning(f"Lỗi sao lưu GitHub: {msg}")
         else:
             st.info("ℹ️ Không có thay đổi mới nào.")
 
