@@ -9,14 +9,12 @@ st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho", layout="wide")
 
 DEFAULT_DATA_FILE = "latest_inventory_list.xlsx"
 
-st.title("📋 HỆ THỐNG KIỂM KÊ KHO - GỌN GÀNG & ỔN ĐỊNH")
+st.title("📋 HỆ THỐNG KIỂM KÊ KHO - ỔN ĐỊNH TRÊN CLOUD")
 st.markdown("---")
 
-# Khởi tạo session state cho dòng tiêu đề
 if 'header_line' not in st.session_state:
     st.session_state['header_line'] = 4
 
-# Hàm cập nhật thông minh xuống file Excel gốc trên ổ cứng
 def save_updates_to_excel_file():
     if 'sheets_data' in st.session_state and st.session_state['sheets_data'] and os.path.exists(DEFAULT_DATA_FILE):
         try:
@@ -57,17 +55,19 @@ def save_updates_to_excel_file():
                 for s_name, df_val in st.session_state['sheets_data'].items():
                     df_val.to_excel(writer, index=False, sheet_name=s_name)
 
-# ==========================================
-# 1. XÁC THỰC & QUẢN LÝ TẢI FILE TRÊN SIDEBAR
-# ==========================================
 with st.sidebar:
     st.header("🔐 XÁC THỰC NGƯỜI DÙNG")
+    
+    # Sửa lỗi lấy IP an toàn cho cả Cloud và Local
     try:
-        client_ip = st.context.headers.get("X-Forwarded-For", "Mạng Nội Bộ / Localhost")
+        if hasattr(st, "context") and hasattr(st.context, "headers"):
+            client_ip = st.context.headers.get("X-Forwarded-For", "Cloud User")
+        else:
+            client_ip = "Streamlit Cloud"
     except Exception:
         client_ip = "Không xác định"
 
-    st.info(f"🌐 Địa chỉ IP máy bạn:\n`{client_ip}`")
+    st.info(f"🌐 Trạng thái kết nối:\n`Hoạt động ổn định`")
 
     user_role = st.selectbox("Chọn vai trò:", ["Nhân viên kho (Chỉ nhập SLKK)", "Quản trị viên (Admin)"])
     admin_password = st.text_input("Mật khẩu Admin:", type="password") if user_role == "Quản trị viên (Admin)" else ""
@@ -91,7 +91,6 @@ with st.sidebar:
                 new_sheets = {}
                 for s_name, df_s in raw_dfs.items():
                     df_s = df_s.dropna(how='all')
-                    # Tự động xóa sạch các cột trống hoặc cột rỗng không có tên (Unnamed)
                     df_s = df_s.dropna(axis=1, how='all')
                     df_s = df_s.loc[:, ~df_s.columns.astype(str).str.contains('^Unnamed')]
 
@@ -107,9 +106,6 @@ with st.sidebar:
         else:
             st.warning("⚠️ Cần chọn 'Quản trị viên (Admin)' và nhập đúng mật khẩu (`123456`) để áp dụng file mới!")
 
-# ==========================================
-# 2. TỰ ĐỘNG LOAD DỮ LIỆU TỪ Ổ CỨNG KHI MỞ / F5
-# ==========================================
 if 'sheets_data' not in st.session_state:
     if os.path.exists(DEFAULT_DATA_FILE):
         try:
@@ -130,18 +126,14 @@ if 'sheets_data' not in st.session_state:
     else:
         st.session_state['sheets_data'] = {}
 
-# ==========================================
-# 3. HIỂN THỊ GIAO DIỆN CHÍNH
-# ==========================================
 if not st.session_state['sheets_data']:
     st.warning("⚠️ Chưa có dữ liệu trong hệ thống. Quản trị viên hãy đăng nhập Admin (Mật khẩu: `123456`) và tải file Excel lên ở thanh bên trái!")
 else:
     if user_role == "Nhân viên kho (Chỉ nhập SLKK)":
-        st.info("💡 **Hướng dẫn:** Nhập số lượng vào cột **SLKK** trên bảng, sau đó bấm nút **💾 LƯU TẤT CẢ THAY ĐỔI** ở dưới cùng. Dữ liệu sẽ được lưu cứng vào file, F5 thoải mái không bao giờ mất.")
+        st.info("💡 **Hướng dẫn:** Nhập số lượng vào cột **SLKK** trên bảng, sau đó bấm nút **💾 LƯU TẤT CẢ THAY ĐỔI** ở dưới cùng.")
     else:
         st.success("👑 Bạn đang ở chế độ **Quản trị viên (Admin)**: Toàn quyền chỉnh sửa dữ liệu.")
 
-    # Gộp tất cả các sheet lại thành một bảng duy nhất để hiển thị trực quan
     combined_list = []
     for s_name, df_val in st.session_state['sheets_data'].items():
         df_t = df_val.copy()
@@ -149,7 +141,6 @@ else:
         combined_list.append(df_t)
     master_df = pd.concat(combined_list, ignore_index=True)
 
-    # Ô tìm kiếm / lọc nhanh trên bảng
     col_f1, col_f2 = st.columns(2)
     with col_f1:
         s_loc = st.text_input("🔍 Lọc nhanh theo Location:", placeholder="VD: AA715...")
@@ -162,9 +153,6 @@ else:
 
     locked_cols = [col for col in master_df.columns if col != 'SLKK' and col != '_SheetName'] if user_role.startswith("Nhân viên") else []
 
-    # ==========================================
-    # 4. BẢNG TRONG FORM (NHẬP LIỆU MƯỢT MÀ, KHÔNG NHẤP NHÁY)
-    # ==========================================
     with st.form(key="inventory_form"):
         edited_master_df = st.data_editor(
             master_df,
@@ -177,7 +165,6 @@ else:
         
         submitted = st.form_submit_button("💾 LƯU TẤT CẢ THAY ĐỔI", type="primary", use_container_width=True)
 
-    # Xử lý lưu khi bấm nút
     if submitted:
         now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         has_changes = False
@@ -202,13 +189,10 @@ else:
 
         if has_changes:
             save_updates_to_excel_file()
-            st.success("🎉 Đã lưu tất cả thay đổi vào hệ thống thành công! Dữ liệu đã được khóa an toàn, bạn có thể F5 thoải mái.")
+            st.success("🎉 Đã lưu tất cả thay đổi vào hệ thống thành công!")
         else:
             st.info("ℹ️ Không có thay đổi mới nào được ghi nhận.")
 
-    # ==========================================
-    # 5. TẢI XUỐNG KẾT QUẢ
-    # ==========================================
     st.markdown("---")
     st.subheader("💾 TẢI XUỐNG KẾT QUẢ")
     output = io.BytesIO()
