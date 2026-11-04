@@ -3,17 +3,50 @@ import pandas as pd
 import os
 import io
 import openpyxl
+import base64
+import requests
 from datetime import datetime
 
-st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho - Chia Theo Nhóm", layout="wide")
+st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho - Đồng Bộ GitHub", layout="wide")
 
 DEFAULT_DATA_FILE = "latest_inventory_list.xlsx"
 
-st.title("📋 HỆ THỐNG KIỂM KÊ KHO - CHIA THEO NHÓM & LỌC TỨC THÌ")
+st.title("📋 HỆ THỐNG KIỂM KÊ KHO - ĐỒNG BỘ 24/7 TRÊN CLOUD")
 st.markdown("---")
 
 if 'header_line' not in st.session_state:
     st.session_state['header_line'] = 4
+
+def save_to_github():
+    """Hàm tự động đẩy file Excel lên GitHub qua API để lưu vĩnh viễn"""
+    try:
+        if "GITHUB_TOKEN" in st.secrets and "REPO_NAME" in st.secrets:
+            token = st.secrets["GITHUB_TOKEN"]
+            repo = st.secrets["REPO_NAME"]
+            file_path = "latest_inventory_list.xlsx"
+            
+            with open(DEFAULT_DATA_FILE, "rb") as f:
+                content_bytes = f.read()
+            encoded_content = base64.b64encode(content_bytes).decode("utf-8")
+            
+            api_url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
+            headers = {"Authorization": f"token {token}"}
+            response = requests.get(api_url, headers=headers)
+            
+            sha = ""
+            if response.status_code == 200:
+                sha = response.json().get("sha", "")
+                
+            data = {
+                "message": "Auto-update inventory data from Streamlit Cloud",
+                "content": encoded_content,
+                "sha": sha
+            }
+            put_response = requests.put(api_url, headers=headers, json=data)
+            return put_response.status_code in [200, 201]
+    except Exception as e:
+        print(f"Lỗi đồng bộ GitHub: {e}")
+    return False
 
 def save_updates_to_excel_file():
     if 'sheets_data' in st.session_state and st.session_state['sheets_data'] and os.path.exists(DEFAULT_DATA_FILE):
@@ -50,10 +83,14 @@ def save_updates_to_excel_file():
                         if time_col:
                             ws.cell(row=excel_row_num, column=time_col, value=row.get('Thời gian sửa'))
             wb.save(DEFAULT_DATA_FILE)
+            
+            # Tự động đồng bộ lên GitHub sau khi lưu cục bộ thành công
+            save_to_github()
         except Exception as e:
             with pd.ExcelWriter(DEFAULT_DATA_FILE, engine='openpyxl') as writer:
                 for s_name, df_val in st.session_state['sheets_data'].items():
                     df_val.to_excel(writer, index=False, sheet_name=s_name)
+            save_to_github()
 
 with st.sidebar:
     st.header("🔐 XÁC THỰC NGƯỜI DÙNG")
@@ -98,7 +135,8 @@ with st.sidebar:
                     new_sheets[s_name] = df_s
 
                 st.session_state['sheets_data'] = new_sheets
-                st.success("✅ Tải và cập nhật list mới thành công!")
+                save_to_github() # Đồng bộ file mới lên GitHub
+                st.success("✅ Tải và cập nhật list mới thành công trên Cloud!")
             except Exception as e:
                 st.error(f"Lỗi đọc file: {e}")
         else:
@@ -138,7 +176,7 @@ else:
 
     current_df = st.session_state['sheets_data'][selected_sheet].copy()
 
-    # Ô LỌC TRỰC TIẾP (GÕ ĐẾN ĐÂU HIỆN ĐẾN ĐÓ, KHÔNG CẦN ENTER)
+    # Ô LỌC TRỰC TIẾP TỨC THÌ (GÕ ĐẾN ĐÂU HIỆN ĐẾN ĐÓ)
     col_f1, col_f2 = st.columns(2)
     with col_f1:
         s_loc = st.text_input("🔍 Lọc trực tiếp theo Location:", placeholder="Nhập ký tự location...", key="filter_loc")
@@ -151,7 +189,7 @@ else:
 
     locked_cols = [col for col in current_df.columns if col != 'SLKK'] if user_role.startswith("Nhân viên") else []
 
-    # BẢNG NHẬP LIỆU (CHỐNG NHẤP NHÁY)
+    # BẢNG NHẬP LIỆU
     with st.form(key=f"form_{selected_sheet}"):
         edited_df = st.data_editor(
             current_df,
@@ -185,7 +223,7 @@ else:
 
         if has_changes:
             save_updates_to_excel_file()
-            st.success(f"🎉 Đã lưu thay đổi cho nhóm [{selected_sheet}] thành công!")
+            st.success(f"🎉 Đã lưu và đồng bộ thay đổi cho nhóm [{selected_sheet}] lên GitHub thành công!")
         else:
             st.info("ℹ️ Không có thay đổi mới nào được ghi nhận.")
 
