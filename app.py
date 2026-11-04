@@ -1,285 +1,410 @@
-import streamlit as st
-import pandas as pd
-import os
-import io
-import openpyxl
 import base64
-import requests
+import hmac
+import io
+import json
+import os
+import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho - Phân Nhóm & Bảo Mật", layout="wide")
+import pandas as pd
+import requests
+import streamlit as st
 
-DEFAULT_DATA_FILE = "latest_inventory_list.xlsx"
+st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho", layout="wide")
 
-st.title("📋 HỆ THỐNG KIỂM KÊ KHO - PHÂN NHÓM & ĐỒNG BỘ 24/7")
-st.markdown("---")
+DB_FILE = "inventory.db"
+GH_PATH = "inventory.db"
+META_COLS = ["Người cập nhật", "Cập nhật bởi (IP)", "Thời gian sửa"]
+GROUPS = ["Xuất khẩu", "HBM", "Nội địa", "Vật tư giao thẳng"]
 
-if 'header_line' not in st.session_state:
-    st.session_state['header_line'] = 4
 
-def save_to_github():
-    """Hàm tự động đẩy file Excel lên GitHub qua API để lưu vĩnh viễn 24/7"""
+# ───────────────────────── SECRETS ─────────────────────────
+def get_secret(key):
     try:
-        if "GITHUB_TOKEN" in st.secrets and "REPO_NAME" in st.secrets:
-            token = st.secrets["GITHUB_TOKEN"]
-            repo = st.secrets["REPO_NAME"]
-            file_path = "latest_inventory_list.xlsx"
-            
-            with open(DEFAULT_DATA_FILE, "rb") as f:
-                content_bytes = f.read()
-            encoded_content = base64.b64encode(content_bytes).decode("utf-8")
-            
-            api_url = f"https://api.github.com/repos/{repo}/contents/{file_path}"
-            headers = {"Authorization": f"token {token}"}
-            response = requests.get(api_url, headers=headers)
-            
-            sha = ""
-            if response.status_code == 200:
-                sha = response.json().get("sha", "")
-                
-            data = {
-                "message": "Auto-update inventory data from Streamlit Cloud",
-                "content": encoded_content,
-                "sha": sha
-            }
-            put_response = requests.put(api_url, headers=headers, json=data)
-            return put_response.status_code in [200, 201]
+        return str(st.secrets[key])
+    except Exception:
+        return None
+
+
+# ───────────────────────── DATABASE ─────────────────────────
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sheets(
+                name TEXT PRIMARY KEY, cols TEXT, pos INTEGER);
+            CREATE TABLE IF NOT EXISTS items(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sheet TEXT, data TEXT, slkk REAL,
+                updated_by TEXT DEFAULT '', ip TEXT DEFAULT '',
+                updated_at TEXT DEFAULT '');
+            CREATE INDEX IF NOT EXISTS idx_items_sheet ON items(sheet);
+            CREATE TABLE IF NOT EXISTS log(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, user TEXT, ip TEXT, sheet TEXT,
+                item_id INTEGER, col TEXT, old TEXT, new TEXT);
+            """
+        )
+
+
+# ───────────────────────── GITHUB BACKUP ─────────────────────────
+@st.cache_resource
+def backup_lock():
+    return threading.Lock()
+
+
+def gh_conf():
+    token, repo = get_secret("GITHUB_TOKEN"), get_secret("REPO_NAME")
+    if token and repo:
+        return token, repo
+    return None
+
+
+def restore_from_github():
+    cfg = gh_conf()
+    if not cfg:
+        return
+    token, repo = cfg
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/contents/{GH_PATH}",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.raw",
+            },
+            timeout=60,
+        )
+        if r.status_code == 200 and r.content:
+            with open(DB_FILE, "wb") as f:
+                f.write(r.content)
     except Exception as e:
-        print(f"Lỗi đồng bộ GitHub: {e}")
-    return False
+        print(f"Restore GitHub lỗi: {e}")
 
+
+def backup_to_github():
+    """Trả về (ok, thông báo)."""
+    cfg = gh_conf()
+    if not cfg:
+        return False, "Chưa cấu hình GITHUB_TOKEN / REPO_NAME"
+    token, repo = cfg
+    url = f"https://api.github.com/repos/{repo}/contents/{GH_PATH}"
+    headers = {"Authorization": f"token {token}"}
+    tmp = DB_FILE + ".bak"
+    try:
+        with backup_lock():
+            src, dst = sqlite3.connect(DB_FILE), sqlite3.connect(tmp)
+            src.backup(dst)
+            dst.close()
+            src.close()
+            with open(tmp, "rb") as f:
+                content = base64.b64encode(f.read()).decode()
+
+            last = None
+            for _ in range(2):
+                g = requests.get(url, headers=headers, timeout=30)
+                payload = {
+                    "message": "Auto-backup inventory.db từ Streamlit",
+                    "content": content,
+                }
+                if g.status_code == 200:
+                    payload["sha"] = g.json().get("sha")
+                p = requests.put(url, headers=headers, json=payload, timeout=60)
+                last = p
+                if p.status_code in (200, 201):
+                    return True, "OK"
+            return False, f"GitHub trả về {last.status_code}: {last.text[:150]}"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+@st.cache_resource
+def init_app():
+    if not os.path.exists(DB_FILE):
+        restore_from_github()
+    init_db()
+    return True
+
+
+# ───────────────────────── LOGIC ─────────────────────────
 def get_major_group(sheet_name):
-    """Hàm phân loại sheet vào 4 nhóm lớn theo yêu cầu"""
-    s_lower = sheet_name.lower()
-    if "hbm" in s_lower:
+    s = sheet_name.lower()
+    if "hbm" in s:
         return "HBM"
-    elif "nội địa" in s_lower or "noi dia" in s_lower or "domestic" in s_lower:
+    if "nội địa" in s or "noi dia" in s or "domestic" in s:
         return "Nội địa"
-    elif "direct" in s_lower or "giao thẳng" in s_lower or "vật tư" in s_lower or "vat tu" in s_lower:
+    if any(k in s for k in ["direct", "giao thẳng", "vật tư", "vat tu"]):
         return "Vật tư giao thẳng"
-    else:
-        return "Xuất khẩu"
+    return "Xuất khẩu"
 
-def save_updates_to_excel_file():
-    if 'sheets_data' in st.session_state and st.session_state['sheets_data'] and os.path.exists(DEFAULT_DATA_FILE):
-        try:
-            header_idx = st.session_state['header_line'] - 1
-            header_row_num = header_idx + 1
-            
-            wb = openpyxl.load_workbook(DEFAULT_DATA_FILE)
-            for s_name, df_val in st.session_state['sheets_data'].items():
-                if s_name in wb.sheetnames:
-                    ws = wb[s_name]
-                    col_map = {}
-                    for col_idx in range(1, ws.max_column + 1):
-                        val = ws.cell(row=header_row_num, column=col_idx).value
-                        if val:
-                            col_map[str(val).strip()] = col_idx
-                    
-                    # Đảm bảo đủ các cột lưu vết
-                    for needed_col in ['SLKK', 'Người cập nhật', 'Cập nhật bởi (IP)', 'Thời gian sửa']:
-                        if needed_col not in col_map:
-                            new_col_idx = ws.max_column + 1
-                            ws.cell(row=header_row_num, column=new_col_idx, value=needed_col)
-                            col_map[needed_col] = new_col_idx
 
-                    slkk_col = col_map.get('SLKK')
-                    user_col = col_map.get('Người cập nhật')
-                    ip_col = col_map.get('Cập nhật bởi (IP)')
-                    time_col = col_map.get('Thời gian sửa')
+def norm(v):
+    return None if pd.isna(v) else v
 
-                    for r_idx, row in df_val.iterrows():
-                        excel_row_num = header_row_num + 1 + r_idx
-                        if slkk_col:
-                            ws.cell(row=excel_row_num, column=slkk_col, value=row.get('SLKK'))
-                        if user_col:
-                            ws.cell(row=excel_row_num, column=user_col, value=row.get('Người cập nhật'))
-                        if ip_col:
-                            ws.cell(row=excel_row_num, column=ip_col, value=row.get('Cập nhật bởi (IP)'))
-                        if time_col:
-                            ws.cell(row=excel_row_num, column=time_col, value=row.get('Thời gian sửa'))
-            wb.save(DEFAULT_DATA_FILE)
-            save_to_github()
-        except Exception as e:
-            with pd.ExcelWriter(DEFAULT_DATA_FILE, engine='openpyxl') as writer:
-                for s_name, df_val in st.session_state['sheets_data'].items():
-                    df_val.to_excel(writer, index=False, sheet_name=s_name)
-            save_to_github()
+
+def now_vn():
+    return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_client_ip():
+    try:
+        ip = st.context.headers.get("X-Forwarded-For", "")
+        return ip.split(",")[0].strip() or "Cloud User"
+    except Exception:
+        return "Không xác định"
+
+
+def import_excel(file_bytes, header_idx):
+    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=header_idx, dtype=str)
+    with db() as c:
+        c.execute("DELETE FROM sheets")
+        c.execute("DELETE FROM items")
+        for pos, (name, df) in enumerate(raw.items()):
+            df = df.dropna(how="all").dropna(axis=1, how="all")
+            df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")]
+            df.columns = [str(x).strip() for x in df.columns]
+            slkk = (
+                pd.to_numeric(df["SLKK"], errors="coerce")
+                if "SLKK" in df.columns
+                else pd.Series([None] * len(df), index=df.index, dtype="float")
+            )
+            df = df.drop(columns=[x for x in ["SLKK"] + META_COLS if x in df.columns])
+            df = df.astype(object).where(df.notna(), None)
+            c.execute(
+                "INSERT INTO sheets(name, cols, pos) VALUES (?,?,?)",
+                (name, json.dumps(list(df.columns), ensure_ascii=False), pos),
+            )
+            rows = [
+                (name, json.dumps(rec, ensure_ascii=False), None if pd.isna(s) else float(s))
+                for rec, s in zip(df.to_dict("records"), slkk)
+            ]
+            c.executemany("INSERT INTO items(sheet, data, slkk) VALUES (?,?,?)", rows)
+
+
+def list_sheets():
+    with db() as c:
+        return [r["name"] for r in c.execute("SELECT name FROM sheets ORDER BY pos")]
+
+
+def load_df(sheet):
+    with db() as c:
+        cols = json.loads(c.execute("SELECT cols FROM sheets WHERE name=?", (sheet,)).fetchone()["cols"])
+        rows = c.execute(
+            "SELECT id, data, slkk, updated_by, ip, updated_at FROM items WHERE sheet=? ORDER BY id",
+            (sheet,),
+        ).fetchall()
+    df = pd.DataFrame([json.loads(r["data"]) for r in rows], columns=cols)
+    df["SLKK"] = pd.Series([r["slkk"] for r in rows], dtype="float")
+    df[META_COLS[0]] = [r["updated_by"] for r in rows]
+    df[META_COLS[1]] = [r["ip"] for r in rows]
+    df[META_COLS[2]] = [r["updated_at"] for r in rows]
+    df.index = pd.Index([r["id"] for r in rows], name="id")
+    return df, cols
+
+
+def save_changes(sheet, original, edited, data_cols, user, ip, is_admin):
+    ts, changed, conflicts = now_vn(), 0, 0
+    with db() as c:
+        for rid in edited.index:
+            if rid not in original.index:
+                continue
+            old, new = original.loc[rid], edited.loc[rid]
+            cur = c.execute("SELECT data, slkk FROM items WHERE id=?", (int(rid),)).fetchone()
+            if cur is None:
+                continue
+            data, slkk_val, dirty = json.loads(cur["data"]), cur["slkk"], False
+
+            new_s, old_s = norm(new["SLKK"]), norm(old["SLKK"])
+            if new_s != old_s:
+                if cur["slkk"] != old_s:
+                    conflicts += 1
+                c.execute(
+                    "INSERT INTO log(ts,user,ip,sheet,item_id,col,old,new) VALUES (?,?,?,?,?,?,?,?)",
+                    (ts, user, ip, sheet, int(rid), "SLKK", str(cur["slkk"]), str(new_s)),
+                )
+                slkk_val, dirty = (None if new_s is None else float(new_s)), True
+
+            if is_admin:
+                for col in data_cols:
+                    if norm(new[col]) != norm(old[col]):
+                        c.execute(
+                            "INSERT INTO log(ts,user,ip,sheet,item_id,col,old,new) VALUES (?,?,?,?,?,?,?,?)",
+                            (ts, user, ip, sheet, int(rid), col, str(old[col]), str(new[col])),
+                        )
+                        data[col] = norm(new[col])
+                        dirty = True
+
+            if dirty:
+                c.execute(
+                    "UPDATE items SET data=?, slkk=?, updated_by=?, ip=?, updated_at=? WHERE id=?",
+                    (json.dumps(data, ensure_ascii=False), slkk_val, user, ip, ts, int(rid)),
+                )
+                changed += 1
+    return changed, conflicts
+
+
+def build_xlsx():
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        for s in list_sheets():
+            df, _ = load_df(s)
+            df.reset_index(drop=True).to_excel(w, index=False, sheet_name=s[:31])
+    return out.getvalue()
+
+
+def build_log_csv():
+    with db() as c:
+        df = pd.read_sql_query("SELECT * FROM log ORDER BY id DESC", c)
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+# ───────────────────────── UI ─────────────────────────
+init_app()
+st.session_state.setdefault("ver", 0)
+
+st.title("📋 HỆ THỐNG KIỂM KÊ KHO")
+st.markdown("---")
 
 with st.sidebar:
     st.header("👤 THÔNG TIN NGƯỜI DÙNG")
-    input_user_name = st.text_input("Nhập họ tên của bạn:", value=st.session_state.get('user_name', ''), placeholder="VD: Nguyễn Thị Trang")
-    st.session_state['user_name'] = input_user_name
+    user_name = st.text_input("Nhập họ tên của bạn:", placeholder="VD: Nguyễn Thị Trang").strip()
 
     st.markdown("---")
-    st.header("🔐 XÁC THỰC QUẢN TRỊ")
-    user_role = st.selectbox("Chọn vai trò:", ["Nhân viên kho (Chỉ nhập SLKK)", "Quản trị viên (Admin)"])
-    admin_password = st.text_input("Mật khẩu Admin:", type="password") if user_role == "Quản trị viên (Admin)" else ""
+    st.header("🔐 VAI TRÒ")
+    role = st.selectbox("Chọn vai trò:", ["Nhân viên kho (Chỉ nhập SLKK)", "Quản trị viên (Admin)"])
+    is_admin = False
+    if role.startswith("Quản trị"):
+        expected = get_secret("ADMIN_PASSWORD")
+        pw = st.text_input("Mật khẩu Admin:", type="password")
+        if not expected:
+            st.error("Chưa cấu hình ADMIN_PASSWORD trong secrets.")
+        elif pw:
+            if hmac.compare_digest(pw.encode(), expected.encode()):
+                is_admin = True
+            else:
+                st.error("Sai mật khẩu.")
 
-    st.markdown("---")
-    st.header("⚙️ QUẢN LÝ DỮ LIỆU (ADMIN)")
-    
-    header_line = st.number_input("Dòng chứa tiêu đề (Header row):", min_value=1, value=st.session_state['header_line'], step=1)
-    st.session_state['header_line'] = header_line
-    header_idx = header_line - 1
-
-    uploaded_file = st.file_uploader("📂 Tải list kiểm kê mới (Excel):", type=["xlsx", "xls"])
-    
-    if uploaded_file is not None:
-        if user_role == "Quản trị viên (Admin)" and admin_password == "123456":
+    if is_admin:
+        st.markdown("---")
+        st.header("⚙️ QUẢN LÝ DỮ LIỆU")
+        header_line = st.number_input("Dòng chứa tiêu đề (Header row):", min_value=1, value=4, step=1)
+        up = st.file_uploader("📂 Tải list kiểm kê mới (Excel):", type=["xlsx", "xls"])
+        confirm = st.checkbox("Tôi hiểu: áp dụng file mới sẽ thay toàn bộ dữ liệu hiện tại")
+        if st.button("✅ Áp dụng file này", disabled=not (up and confirm)):
             try:
-                with open(DEFAULT_DATA_FILE, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-
-                raw_dfs = pd.read_excel(DEFAULT_DATA_FILE, sheet_name=None, header=header_idx, dtype=str)
-                new_sheets = {}
-                for s_name, df_s in raw_dfs.items():
-                    df_s = df_s.dropna(how='all')
-                    df_s = df_s.dropna(axis=1, how='all')
-                    df_s = df_s.loc[:, ~df_s.columns.astype(str).str.contains('^Unnamed')]
-
-                    if 'SLKK' not in df_s.columns: df_s['SLKK'] = None
-                    if 'Người cập nhật' not in df_s.columns: df_s['Người cập nhật'] = ""
-                    if 'Cập nhật bởi (IP)' not in df_s.columns: df_s['Cập nhật bởi (IP)'] = ""
-                    if 'Thời gian sửa' not in df_s.columns: df_s['Thời gian sửa'] = ""
-                    new_sheets[s_name] = df_s
-
-                st.session_state['sheets_data'] = new_sheets
-                save_to_github()
-                st.success("✅ Tải và cập nhật list mới thành công!")
+                import_excel(up.getvalue(), header_line - 1)
+                ok, msg = backup_to_github()
+                st.session_state["ver"] += 1
+                st.success("Đã nạp list mới." + ("" if ok else f" (Chưa sao lưu GitHub: {msg})"))
             except Exception as e:
                 st.error(f"Lỗi đọc file: {e}")
-        else:
-            st.warning("⚠️ Cần chọn 'Quản trị viên (Admin)' và nhập đúng mật khẩu (`123456`) để áp dụng file mới!")
 
-if 'sheets_data' not in st.session_state:
-    if os.path.exists(DEFAULT_DATA_FILE):
-        try:
-            header_idx = st.session_state['header_line'] - 1
-            raw_dfs = pd.read_excel(DEFAULT_DATA_FILE, sheet_name=None, header=header_idx, dtype=str)
-            st.session_state['sheets_data'] = {}
-            for s_name, df_s in raw_dfs.items():
-                df_s = df_s.dropna(how='all')
-                df_s = df_s.dropna(axis=1, how='all')
-                df_s = df_s.loc[:, ~df_s.columns.astype(str).str.contains('^Unnamed')]
+        if st.button("☁️ Sao lưu lên GitHub ngay"):
+            ok, msg = backup_to_github()
+            st.success("Đã sao lưu.") if ok else st.error(msg)
 
-                if 'SLKK' not in df_s.columns: df_s['SLKK'] = None
-                if 'Người cập nhật' not in df_s.columns: df_s['Người cập nhật'] = ""
-                if 'Cập nhật bởi (IP)' not in df_s.columns: df_s['Cập nhật bởi (IP)'] = ""
-                if 'Thời gian sửa' not in df_s.columns: df_s['Thời gian sửa'] = ""
-                st.session_state['sheets_data'][s_name] = df_s
-        except Exception:
-            st.session_state['sheets_data'] = {}
-    else:
-        st.session_state['sheets_data'] = {}
-
-if not st.session_state['sheets_data']:
-    st.warning("⚠️ Chưa có dữ liệu trong hệ thống. Quản trị viên hãy đăng nhập Admin (Mật khẩu: `123456`) và tải file Excel lên ở thanh bên trái!")
-else:
-    if user_role == "Nhân viên kho (Chỉ nhập SLKK)":
-        st.info("💡 **Hướng dẫn:** Nhập họ tên ở thanh bên trái -> Chọn Nhóm lớn -> Chọn Nhóm nhỏ (Sheet) -> Nhập số lượng vào cột **SLKK** -> Bấm nút **💾 LƯU TẤT CẢ THAY ĐỔI**.")
-    else:
-        st.success("👑 Bạn đang ở chế độ **Quản trị viên (Admin)**: Toàn quyền chỉnh sửa dữ liệu toàn bộ các cột.")
-
-    # TẠO GIAO DIỆN CHỌN 2 CẤP (NHÓM LỚN -> NHÓM NHỎ THEO SHEET)
-    all_sheets = list(st.session_state['sheets_data'].keys())
-    
-    # Gom các sheet vào nhóm lớn tương ứng
-    group_mapping = {"Xuất khẩu": [], "HBM": [], "Nội địa": [], "Vật tư giao thẳng": []}
-    for s in all_sheets:
-        m_group = get_major_group(s)
-        group_mapping[m_group].append(s)
-
-    # Lọc bỏ các nhóm lớn không có sheet nào
-    available_major_groups = [g for g, lst in group_mapping.items() if len(lst) > 0]
-
-    col_g1, col_g2 = st.columns(2)
-    with col_g1:
-        selected_major_group = st.selectbox("📂 Chọn Nhóm lớn:", available_major_groups)
-    with col_g2:
-        sub_sheets = group_mapping.get(selected_major_group, all_sheets)
-        selected_sheet = st.selectbox("📋 Chọn Nhóm nhỏ (Sheet):", sub_sheets)
-
-    current_df = st.session_state['sheets_data'][selected_sheet].copy()
-
-    # Ô LỌC TRỰC TIẾP TỨC THÌ
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        s_loc = st.text_input("🔍 Lọc trực tiếp theo Location:", placeholder="Nhập ký tự location...", key="filter_loc")
-        if s_loc and 'location' in current_df.columns:
-            current_df = current_df[current_df['location'].astype(str).str.contains(s_loc, case=False, na=False)]
-    with col_f2:
-        s_mat = st.text_input("🔍 Lọc trực tiếp theo Mã vật tư:", placeholder="Nhập mã vật tư...", key="filter_mat")
-        if s_mat and 'material_no' in current_df.columns:
-            current_df = current_df[current_df['material_no'].astype(str).str.contains(s_mat, case=False, na=False)]
-
-    # Phân quyền: Nhân viên chỉ được sửa cột SLKK, khóa toàn bộ các cột còn lại
-    locked_cols = [col for col in current_df.columns if col != 'SLKK'] if user_role.startswith("Nhân viên") else []
-
-    # BẢNG NHẬP LIỆU
-    with st.form(key=f"form_{selected_sheet}"):
-        edited_df = st.data_editor(
-            current_df,
-            disabled=locked_cols,
-            hide_index=True,
-            use_container_width=True,
-            height=500,
-            key=f"editor_{selected_sheet}"
+        st.download_button(
+            "📜 Tải nhật ký chỉnh sửa (CSV)", build_log_csv(), "nhat_ky_chinh_sua.csv", "text/csv"
         )
-        
-        submitted = st.form_submit_button(f"💾 LƯU THAY ĐỔI (NHÓM: {selected_sheet})", type="primary", use_container_width=True)
 
-    if submitted:
-        current_name = st.session_state.get('user_name', '').strip()
-        if not current_name:
-            st.warning("⚠️ Vui lòng nhập **Họ tên của bạn** ở thanh bên trái trước khi lưu thay đổi!")
+sheets = list_sheets()
+if not sheets:
+    st.warning("⚠️ Chưa có dữ liệu. Quản trị viên hãy đăng nhập Admin và tải file Excel lên ở thanh bên trái.")
+    st.stop()
+
+if is_admin:
+    st.success("👑 Chế độ **Quản trị viên**: được sửa tất cả các cột dữ liệu.")
+else:
+    st.info("💡 Nhập họ tên (thanh bên trái) → chọn Nhóm lớn → Nhóm nhỏ → nhập **SLKK** → bấm **LƯU**. "
+            "Hãy lưu trước khi đổi bộ lọc, vì đổi bộ lọc sẽ làm mới bảng.")
+
+group_map = {g: [] for g in GROUPS}
+for s in sheets:
+    group_map[get_major_group(s)].append(s)
+available = [g for g, lst in group_map.items() if lst]
+
+c1, c2 = st.columns(2)
+with c1:
+    major = st.selectbox("📂 Chọn Nhóm lớn:", available)
+with c2:
+    sheet = st.selectbox("📋 Chọn Nhóm nhỏ (Sheet):", group_map[major])
+
+full_df, data_cols = load_df(sheet)
+done = int(full_df["SLKK"].notna().sum())
+st.caption(f"Đã nhập SLKK: **{done} / {len(full_df)}** dòng trong sheet này.")
+
+view = full_df
+f1, f2 = st.columns(2)
+with f1:
+    s_loc = st.text_input("🔍 Lọc theo Location:", key="filter_loc")
+    if s_loc and "location" in view.columns:
+        view = view[view["location"].astype(str).str.contains(s_loc, case=False, na=False)]
+with f2:
+    s_mat = st.text_input("🔍 Lọc theo Mã vật tư:", key="filter_mat")
+    if s_mat and "material_no" in view.columns:
+        view = view[view["material_no"].astype(str).str.contains(s_mat, case=False, na=False)]
+
+locked = META_COLS if is_admin else [c for c in view.columns if c != "SLKK"]
+original = view.copy()
+
+with st.form(key=f"form_{sheet}"):
+    edited = st.data_editor(
+        view,
+        disabled=locked,
+        hide_index=True,
+        use_container_width=True,
+        height=500,
+        column_config={"SLKK": st.column_config.NumberColumn("SLKK", min_value=0)},
+        key=f"editor_{sheet}_{s_loc}_{s_mat}_{st.session_state['ver']}",
+    )
+    submitted = st.form_submit_button(f"💾 LƯU THAY ĐỔI ({sheet})", type="primary", use_container_width=True)
+
+if submitted:
+    if not user_name:
+        st.warning("⚠️ Vui lòng nhập **Họ tên** ở thanh bên trái trước khi lưu!")
+    else:
+        changed, conflicts = save_changes(
+            sheet, original, edited, data_cols, user_name, get_client_ip(), is_admin
+        )
+        if changed:
+            ok, msg = backup_to_github()
+            st.session_state["ver"] += 1
+            st.success(f"🎉 Đã lưu {changed} dòng của **{user_name}**.")
+            if conflicts:
+                st.warning(f"⚠️ {conflicts} dòng đã được người khác sửa trong lúc bạn nhập; giá trị của bạn đã ghi đè.")
+            if not ok:
+                st.warning(f"Đã lưu trên server nhưng chưa sao lưu được lên GitHub: {msg}")
         else:
-            # Lấy IP an toàn
-            try:
-                if hasattr(st, "context") and hasattr(st.context, "headers"):
-                    client_ip = st.context.headers.get("X-Forwarded-For", "Cloud User")
-                else:
-                    client_ip = "Streamlit Cloud / Local"
-            except Exception:
-                client_ip = "Không xác định"
+            st.info("ℹ️ Không có thay đổi mới nào.")
 
-            # Lấy chuẩn giờ Việt Nam (GMT+7)
-            now_time = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d %H:%M:%S")
-            orig_df = st.session_state['sheets_data'][selected_sheet]
-            has_changes = False
-
-            for _, row in edited_df.iterrows():
-                loc = str(row.get('location', '')).strip()
-                mat = str(row.get('material_no', '')).strip()
-                new_slkk = row.get('SLKK')
-
-                match_mask = (orig_df['location'].astype(str).str.strip() == loc) & (orig_df['material_no'].astype(str).str.strip() == mat)
-                if match_mask.any():
-                    old_val = orig_df.loc[match_mask, 'SLKK'].values[0]
-                    if str(old_val) != str(new_slkk) and pd.notna(new_slkk):
-                        orig_df.loc[match_mask, 'SLKK'] = new_slkk
-                        orig_df.loc[match_mask, 'Người cập nhật'] = current_name
-                        orig_df.loc[match_mask, 'Cập nhật bởi (IP)'] = client_ip
-                        orig_df.loc[match_mask, 'Thời gian sửa'] = now_time
-                        has_changes = True
-
-            if has_changes:
-                save_updates_to_excel_file()
-                st.success(f"🎉 Đã lưu và đồng bộ thay đổi của **{current_name}** lên hệ thống thành công!")
-            else:
-                st.info("ℹ️ Không có thay đổi mới nào được ghi nhận.")
-
-    st.markdown("---")
-    st.subheader("💾 TẢI XUỐNG KẾT QUẢ")
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for s_name, df_val in st.session_state['sheets_data'].items():
-            df_val.to_excel(writer, index=False, sheet_name=s_name)
+st.markdown("---")
+st.subheader("💾 TẢI XUỐNG KẾT QUẢ")
+if st.button("Chuẩn bị file Excel"):
+    st.session_state["xlsx"] = build_xlsx()
+if "xlsx" in st.session_state:
     st.download_button(
-        label="📥 Tải file Excel hoàn chỉnh (Kèm lịch sử Tên, IP, Thời gian)",
-        data=output.getvalue(),
-        file_name="KetQua_KiemKe_Audit.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary"
+        "📥 Tải file Excel (kèm Tên, IP, Thời gian)",
+        st.session_state["xlsx"],
+        "KetQua_KiemKe_Audit.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
     )
