@@ -5,11 +5,11 @@ import io
 import openpyxl
 from datetime import datetime
 
-st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho", layout="wide")
+st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho - Chia Theo Nhóm", layout="wide")
 
 DEFAULT_DATA_FILE = "latest_inventory_list.xlsx"
 
-st.title("📋 HỆ THỐNG KIỂM KÊ KHO - ỔN ĐỊNH TRÊN CLOUD")
+st.title("📋 HỆ THỐNG KIỂM KÊ KHO - CHIA THEO NHÓM & LỌC TỨC THÌ")
 st.markdown("---")
 
 if 'header_line' not in st.session_state:
@@ -57,13 +57,11 @@ def save_updates_to_excel_file():
 
 with st.sidebar:
     st.header("🔐 XÁC THỰC NGƯỜI DÙNG")
-    
-    # Sửa lỗi lấy IP an toàn cho cả Cloud và Local
     try:
         if hasattr(st, "context") and hasattr(st.context, "headers"):
             client_ip = st.context.headers.get("X-Forwarded-For", "Cloud User")
         else:
-            client_ip = "Streamlit Cloud"
+            client_ip = "Streamlit Cloud / Local"
     except Exception:
         client_ip = "Không xác định"
 
@@ -130,66 +128,64 @@ if not st.session_state['sheets_data']:
     st.warning("⚠️ Chưa có dữ liệu trong hệ thống. Quản trị viên hãy đăng nhập Admin (Mật khẩu: `123456`) và tải file Excel lên ở thanh bên trái!")
 else:
     if user_role == "Nhân viên kho (Chỉ nhập SLKK)":
-        st.info("💡 **Hướng dẫn:** Nhập số lượng vào cột **SLKK** trên bảng, sau đó bấm nút **💾 LƯU TẤT CẢ THAY ĐỔI** ở dưới cùng.")
+        st.info("💡 **Hướng dẫn:** Chọn nhóm/sheet ở bên dưới, nhập số lượng vào cột **SLKK**, sau đó bấm nút **💾 LƯU TẤT CẢ THAY ĐỔI**.")
     else:
         st.success("👑 Bạn đang ở chế độ **Quản trị viên (Admin)**: Toàn quyền chỉnh sửa dữ liệu.")
 
-    combined_list = []
-    for s_name, df_val in st.session_state['sheets_data'].items():
-        df_t = df_val.copy()
-        df_t.insert(0, '_SheetName', s_name)
-        combined_list.append(df_t)
-    master_df = pd.concat(combined_list, ignore_index=True)
+    # THANH CHỌN NHÓM / SHEET
+    sheet_names = list(st.session_state['sheets_data'].keys())
+    selected_sheet = st.selectbox("📂 Chọn Nhóm / Sheet kiểm kê:", sheet_names)
 
+    current_df = st.session_state['sheets_data'][selected_sheet].copy()
+
+    # Ô LỌC TRỰC TIẾP (GÕ ĐẾN ĐÂU HIỆN ĐẾN ĐÓ, KHÔNG CẦN ENTER)
     col_f1, col_f2 = st.columns(2)
     with col_f1:
-        s_loc = st.text_input("🔍 Lọc nhanh theo Location:", placeholder="VD: AA715...")
-        if s_loc and 'location' in master_df.columns:
-            master_df = master_df[master_df['location'].astype(str).str.contains(s_loc, case=False, na=False)]
+        s_loc = st.text_input("🔍 Lọc trực tiếp theo Location:", placeholder="Nhập ký tự location...", key="filter_loc")
+        if s_loc and 'location' in current_df.columns:
+            current_df = current_df[current_df['location'].astype(str).str.contains(s_loc, case=False, na=False)]
     with col_f2:
-        s_mat = st.text_input("🔍 Lọc nhanh theo Mã vật tư:", placeholder="Gõ mã...")
-        if s_mat and 'material_no' in master_df.columns:
-            master_df = master_df[master_df['material_no'].astype(str).str.contains(s_mat, case=False, na=False)]
+        s_mat = st.text_input("🔍 Lọc trực tiếp theo Mã vật tư:", placeholder="Nhập mã vật tư...", key="filter_mat")
+        if s_mat and 'material_no' in current_df.columns:
+            current_df = current_df[current_df['material_no'].astype(str).str.contains(s_mat, case=False, na=False)]
 
-    locked_cols = [col for col in master_df.columns if col != 'SLKK' and col != '_SheetName'] if user_role.startswith("Nhân viên") else []
+    locked_cols = [col for col in current_df.columns if col != 'SLKK'] if user_role.startswith("Nhân viên") else []
 
-    with st.form(key="inventory_form"):
-        edited_master_df = st.data_editor(
-            master_df,
+    # BẢNG NHẬP LIỆU (CHỐNG NHẤP NHÁY)
+    with st.form(key=f"form_{selected_sheet}"):
+        edited_df = st.data_editor(
+            current_df,
             disabled=locked_cols,
             hide_index=True,
             use_container_width=True,
-            height=520,
-            key="direct_editor"
+            height=500,
+            key=f"editor_{selected_sheet}"
         )
         
-        submitted = st.form_submit_button("💾 LƯU TẤT CẢ THAY ĐỔI", type="primary", use_container_width=True)
+        submitted = st.form_submit_button(f"💾 LƯU TẤT CẢ THAY ĐỔI (CHO NHÓM: {selected_sheet})", type="primary", use_container_width=True)
 
     if submitted:
         now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        orig_df = st.session_state['sheets_data'][selected_sheet]
         has_changes = False
 
-        for s_name in st.session_state['sheets_data'].keys():
-            subset_edited = edited_master_df[edited_master_df['_SheetName'] == s_name]
-            if not subset_edited.empty:
-                orig_df = st.session_state['sheets_data'][s_name]
-                for _, row in subset_edited.iterrows():
-                    loc = str(row.get('location', '')).strip()
-                    mat = str(row.get('material_no', '')).strip()
-                    new_slkk = row.get('SLKK')
+        for _, row in edited_df.iterrows():
+            loc = str(row.get('location', '')).strip()
+            mat = str(row.get('material_no', '')).strip()
+            new_slkk = row.get('SLKK')
 
-                    match_mask = (orig_df['location'].astype(str).str.strip() == loc) & (orig_df['material_no'].astype(str).str.strip() == mat)
-                    if match_mask.any():
-                        old_val = orig_df.loc[match_mask, 'SLKK'].values[0]
-                        if str(old_val) != str(new_slkk) and pd.notna(new_slkk):
-                            orig_df.loc[match_mask, 'SLKK'] = new_slkk
-                            orig_df.loc[match_mask, 'Cập nhật bởi (IP)'] = client_ip
-                            orig_df.loc[match_mask, 'Thời gian sửa'] = now_time
-                            has_changes = True
+            match_mask = (orig_df['location'].astype(str).str.strip() == loc) & (orig_df['material_no'].astype(str).str.strip() == mat)
+            if match_mask.any():
+                old_val = orig_df.loc[match_mask, 'SLKK'].values[0]
+                if str(old_val) != str(new_slkk) and pd.notna(new_slkk):
+                    orig_df.loc[match_mask, 'SLKK'] = new_slkk
+                    orig_df.loc[match_mask, 'Cập nhật bởi (IP)'] = client_ip
+                    orig_df.loc[match_mask, 'Thời gian sửa'] = now_time
+                    has_changes = True
 
         if has_changes:
             save_updates_to_excel_file()
-            st.success("🎉 Đã lưu tất cả thay đổi vào hệ thống thành công!")
+            st.success(f"🎉 Đã lưu thay đổi cho nhóm [{selected_sheet}] thành công!")
         else:
             st.info("ℹ️ Không có thay đổi mới nào được ghi nhận.")
 
