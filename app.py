@@ -18,7 +18,7 @@ st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho", layout="wide")
 DB_FILE = "inventory.db"
 GH_PATH = "inventory.db"
 META_COLS = ["Người cập nhật", "Cập nhật bởi (IP)", "Thời gian sửa"]
-GROUPS = ["Xuất khẩu", "HBM", "Nội địa", "Vật tư giao thẳng"]
+SECTION_NAMES = ["Xuất khẩu", "HBM", "Nội địa", "Vật tư giao thẳng"]
 
 
 # ───────────────────────── SECRETS ─────────────────────────
@@ -99,7 +99,6 @@ def restore_from_github():
 
 
 def backup_to_github():
-    """Trả về (ok, thông báo)."""
     cfg = gh_conf()
     if not cfg:
         return False, "Chưa cấu hình GITHUB_TOKEN / REPO_NAME"
@@ -146,7 +145,7 @@ def init_app():
 
 
 # ───────────────────────── LOGIC ─────────────────────────
-def get_major_group(sheet_name):
+def get_section_name(sheet_name):
     s = sheet_name.lower()
     if "hbm" in s:
         return "HBM"
@@ -155,6 +154,13 @@ def get_major_group(sheet_name):
     if any(k in s for k in ["direct", "giao thẳng", "vật tư", "vat tu"]):
         return "Vật tư giao thẳng"
     return "Xuất khẩu"
+
+
+def get_nhom_name(sheet_name):
+    """Lấy tên nhóm là phần trước dấu '-' trên sheet (ví dụ 'dầu mỡ-985Y' -> 'dầu mỡ')"""
+    if "-" in sheet_name:
+        return sheet_name.split("-")[0].strip()
+    return sheet_name.strip()
 
 
 def norm(v):
@@ -334,19 +340,34 @@ if not sheets:
 if is_admin:
     st.success("👑 Chế độ **Quản trị viên**: được sửa tất cả các cột dữ liệu.")
 else:
-    st.info("💡 Nhập họ tên (thanh bên trái) → chọn Nhóm lớn → Nhóm nhỏ → nhập **SLKK** → bấm **LƯU**. "
+    st.info("💡 Nhập họ tên (thanh bên trái) → chọn Section Name → Nhóm → nhập **SLKK** → bấm **LƯU**. "
             "Hãy lưu trước khi đổi bộ lọc, vì đổi bộ lọc sẽ làm mới bảng.")
 
-group_map = {g: [] for g in GROUPS}
+# Xây dựng cấu trúc phân cấp: Section Name -> Nhóm (tên trước dấu '-') -> Danh sách sheet chi tiết
+section_map = {sec: {} for sec in SECTION_NAMES}
 for s in sheets:
-    group_map[get_major_group(s)].append(s)
-available = [g for g, lst in group_map.items() if lst]
+    sec = get_section_name(s)
+    nhom = get_nhom_name(s)
+    if nhom not in section_map[sec]:
+        section_map[sec][nhom] = []
+    section_map[sec][nhom].append(s)
 
-c1, c2 = st.columns(2)
+available_sections = [sec for sec, nhoms in section_map.items() if nhoms]
+
+c1, c2, c3 = st.columns(3)
 with c1:
-    major = st.selectbox("📂 Chọn Nhóm lớn:", available)
+    section_name = st.selectbox("📂 Section Name:", available_sections)
 with c2:
-    sheet = st.selectbox("📋 Chọn Nhóm nhỏ (Sheet):", group_map[major])
+    available_nhoms = list(section_map[section_name].keys())
+    nhom_choice = st.selectbox("📋 Nhóm:", available_nhoms)
+with c3:
+    sheet_choices = section_map[section_name][nhom_choice]
+    # Nếu nhóm có nhiều sheet chi tiết (khác tên), cho chọn sheet cụ thể; nếu chỉ có 1 sheet thì tự động lấy luôn
+    if len(sheet_choices) > 1:
+        sheet = st.selectbox("📌 Sheet chi tiết:", sheet_choices)
+    else:
+        sheet = sheet_choices[0]
+        st.text_input("📌 Sheet chi tiết:", value=sheet, disabled=True)
 
 full_df, data_cols = load_df(sheet)
 done = int(full_df["SLKK"].notna().sum())
