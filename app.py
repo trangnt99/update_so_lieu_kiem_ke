@@ -1,446 +1,90 @@
-import base64
-import hmac
+import streamlit as st
+from PIL import Image
+import google.generativeai as genai
 import io
 import json
-import os
-import sqlite3
-import threading
-from contextlib import contextmanager
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
 import pandas as pd
-import requests
-import streamlit as st
 
-st.set_page_config(page_title="Hệ Thống Kiểm Kê Kho", layout="wide")
+st.subheader("📸 Đọc phiếu kiểm kê tối ưu (Cắt 2 cột & Đọc đa ảnh)")
 
-DB_FILE = "inventory.db"
-GH_PATH = "inventory.db"
-EXCEL_FILE = "KK_List.xlsx"  # Tên file Excel mẫu của bạn trên GitHub
-META_COLS = ["Người cập nhật", "Cập nhật bởi (IP)", "Thời gian sửa"]
-SECTION_NAMES = ["Xuất khẩu", "HBM", "Nội địa", "Vật tư giao thẳng"]
+# Cho phép tải lên từ 1 đến nhiều ảnh phiếu kiểm kê
+uploaded_files = st.file_uploader(
+    "Tải lên các ảnh phiếu kiểm kê giấy:", 
+    type=["jpg", "jpeg", "png"], 
+    accept_multiple_files=True
+)
 
+# Tùy chọn tọa độ cắt (tính theo phần trăm 0.0 đến 1.0 từ trái qua phải)
+# Ví dụ: chỉ lấy vùng giữa hoặc bên phải chứa cột Mã vật tư và SLKK
+with st.expander("⚙️ Tùy chỉnh vùng cắt 2 cột (Mã vật tư & SLKK)"):
+    col_left = st.slider("Cắt từ mép trái (%)", 0.0, 0.8, 0.3, 0.05)
+    col_right = st.slider("Cắt đến mép phải (%)", 0.2, 1.0, 1.0, 0.05)
+    col_top = st.slider("Cắt từ trên xuống (%)", 0.0, 0.5, 0.0, 0.05)
+    col_bottom = st.slider("Cắt từ dưới lên (%)", 0.5, 1.0, 1.0, 0.05)
 
-# ───────────────────────── SECRETS ─────────────────────────
-def get_secret(key):
-    try:
-        return str(st.secrets[key])
-    except Exception:
-        return None
+def crop_image_columns(image_bytes, left_p, top_p, right_p, bottom_p):
+    """Hàm cắt vùng chứa 2 cột Mã vật tư và SLKK"""
+    img = Image.open(io.BytesIO(image_bytes))
+    width, height = img.size
+    
+    left = int(width * left_p)
+    top = int(height * top_p)
+    right = int(width * right_p)
+    bottom = int(height * bottom_p)
+    
+    cropped = img.crop((left, top, right, bottom))
+    buf = io.BytesIO()
+    cropped.save(buf, format="JPEG")
+    return buf.getvalue()
 
+if uploaded_files:
+    st.write(f"Đã chọn **{len(uploaded_files)}** ảnh phiếu kiểm kê.")
+    
+    # Hiển thị ảnh sau khi cắt thử nghiệm để kiểm tra
+    for idx, file in enumerate(uploaded_files):
+        cropped_bytes = crop_image_columns(file.getvalue(), col_left, col_top, col_right, col_bottom)
+        st.image(cropped_bytes, caption=f"Vùng 2 cột đã cắt từ ảnh {idx+1}", width=400)
 
-# ───────────────────────── DATABASE ─────────────────────────
-@contextmanager
-def db():
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def init_db():
-    with db() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS sheets(
-                name TEXT PRIMARY KEY, cols TEXT, pos INTEGER);
-            CREATE TABLE IF NOT EXISTS items(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sheet TEXT, data TEXT, slkk REAL,
-                updated_by TEXT DEFAULT '', ip TEXT DEFAULT '',
-                updated_at TEXT DEFAULT '');
-            CREATE INDEX IF NOT EXISTS idx_items_sheet ON items(sheet);
-            CREATE TABLE IF NOT EXISTS log(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT, user TEXT, ip TEXT, sheet TEXT,
-                item_id INTEGER, col TEXT, old TEXT, new TEXT);
-            """
-        )
-
-
-# ───────────────────────── GITHUB BACKUP ─────────────────────────
-@st.cache_resource
-def backup_lock():
-    return threading.Lock()
-
-
-def gh_conf():
-    token, repo = get_secret("GITHUB_TOKEN"), get_secret("REPO_NAME")
-    if token and repo:
-        return token, repo
-    return None
-
-
-def restore_from_github():
-    cfg = gh_conf()
-    if not cfg:
-        return
-    token, repo = cfg
-    try:
-        r = requests.get(
-            f"https://api.github.com/repos/{repo}/contents/{GH_PATH}",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.raw",
-            },
-            timeout=60,
-        )
-        if r.status_code == 200 and r.content:
-            with open(DB_FILE, "wb") as f:
-                f.write(r.content)
-    except Exception as e:
-        print(f"Restore GitHub lỗi: {e}")
-
-
-def backup_to_github():
-    cfg = gh_conf()
-    if not cfg:
-        return False, "Chưa cấu hình GITHUB_TOKEN / REPO_NAME"
-    token, repo = cfg
-    url = f"https://api.github.com/repos/{repo}/contents/{GH_PATH}"
-    headers = {"Authorization": f"token {token}"}
-    tmp = DB_FILE + ".bak"
-    try:
-        with backup_lock():
-            src, dst = sqlite3.connect(DB_FILE), sqlite3.connect(tmp)
-            src.backup(dst)
-            dst.close()
-            src.close()
-            with open(tmp, "rb") as f:
-                content = base64.b64encode(f.read()).decode()
-
-            last = None
-            for _ in range(2):
-                g = requests.get(url, headers=headers, timeout=30)
-                payload = {
-                    "message": "Auto-backup inventory.db từ Streamlit",
-                    "content": content,
-                }
-                if g.status_code == 200:
-                    payload["sha"] = g.json().get("sha")
-                p = requests.put(url, headers=headers, json=payload, timeout=60)
-                last = p
-                if p.status_code in (200, 201):
-                    return True, "OK"
-            return False, f"GitHub trả về {last.status_code}: {last.text[:150]}"
-    except Exception as e:
-        return False, str(e)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-
-
-def load_excel_from_github_to_db(header_idx=3):
-    """Tự động tải file Excel mẫu trực tiếp từ GitHub vào DB"""
-    cfg = gh_conf()
-    if not cfg:
-        return
-    token, repo = cfg
-    try:
-        r = requests.get(
-            f"https://api.github.com/repos/{repo}/contents/{EXCEL_FILE}",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.raw",
-            },
-            timeout=60,
-        )
-        if r.status_code == 200 and r.content:
-            raw = pd.read_excel(io.BytesIO(r.content), sheet_name=None, header=header_idx, dtype=str)
-            with db() as c:
-                # Kiểm tra xem DB đã có dữ liệu chưa, nếu chưa có thì nạp mới
-                count = c.execute("SELECT COUNT(*) FROM sheets").fetchone()[0]
-                if count == 0:
-                    for pos, (name, df) in enumerate(raw.items()):
-                        df = df.dropna(how="all").dropna(axis=1, how="all")
-                        df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")]
-                        df.columns = [str(x).strip() for x in df.columns]
-                        slkk = (
-                            pd.to_numeric(df["SLKK"], errors="coerce")
-                            if "SLKK" in df.columns
-                            else pd.Series([None] * len(df), index=df.index, dtype="float")
-                        )
-                        df = df.drop(columns=[x for x in ["SLKK"] + META_COLS if x in df.columns])
-                        df = df.astype(object).where(df.notna(), None)
-                        c.execute(
-                            "INSERT OR IGNORE INTO sheets(name, cols, pos) VALUES (?,?,?)",
-                            (name, json.dumps(list(df.columns), ensure_ascii=False), pos),
-                        )
-                        rows = [
-                            (name, json.dumps(rec, ensure_ascii=False), None if pd.isna(s) else float(s))
-                            for rec, s in zip(df.to_dict("records"), slkk)
-                        ]
-                        c.executemany("INSERT INTO items(sheet, data, slkk) VALUES (?,?,?)", rows)
-    except Exception as e:
-        print(f"Lỗi load excel từ GitHub: {e}")
-
-
-@st.cache_resource
-def init_app():
-    if not os.path.exists(DB_FILE):
-        restore_from_github()
-    init_db()
-    load_excel_from_github_to_db(header_idx=3)  # Mặc định dòng 4 là header (index 3)
-    return True
-
-
-# ───────────────────────── LOGIC ─────────────────────────
-def get_section_name(sheet_name):
-    s = sheet_name.lower()
-    if "hbm" in s:
-        return "HBM"
-    if "nội địa" in s or "noi dia" in s or "domestic" in s:
-        return "Nội địa"
-    if any(k in s for k in ["direct", "giao thẳng", "vật tư", "vat tu"]):
-        return "Vật tư giao thẳng"
-    return "Xuất khẩu"
-
-
-def get_nhom_name(sheet_name):
-    if "-" in sheet_name:
-        return sheet_name.split("-")[0].strip()
-    return sheet_name.strip()
-
-
-def norm(v):
-    return None if pd.isna(v) else v
-
-
-def now_vn():
-    return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def get_client_ip():
-    try:
-        ip = st.context.headers.get("X-Forwarded-For", "")
-        return ip.split(",")[0].strip() or "Cloud User"
-    except Exception:
-        return "Không xác định"
-
-
-def list_sheets():
-    with db() as c:
-        return [r["name"] for r in c.execute("SELECT name FROM sheets ORDER BY pos")]
-
-
-def load_df(sheet):
-    with db() as c:
-        row_sheet = c.execute("SELECT cols FROM sheets WHERE name=?", (sheet,)).fetchone()
-        if not row_sheet:
-            return pd.DataFrame(), []
-        cols = json.loads(row_sheet["cols"])
-        rows = c.execute(
-            "SELECT id, data, slkk, updated_by, ip, updated_at FROM items WHERE sheet=? ORDER BY id",
-            (sheet,),
-        ).fetchall()
-    df = pd.DataFrame([json.loads(r["data"]) for r in rows], columns=cols)
-    df["SLKK"] = pd.Series([r["slkk"] for r in rows], dtype="float")
-    df[META_COLS[0]] = [r["updated_by"] for r in rows]
-    df[META_COLS[1]] = [r["ip"] for r in rows]
-    df[META_COLS[2]] = [r["updated_at"] for r in rows]
-    df.index = pd.Index([r["id"] for r in rows], name="id")
-    return df, cols
-
-
-def save_changes(sheet, original, edited, data_cols, user, ip, is_admin):
-    ts, changed, conflicts = now_vn(), 0, 0
-    with db() as c:
-        for rid in edited.index:
-            if rid not in original.index:
-                continue
-            old, new = original.loc[rid], edited.loc[rid]
-            cur = c.execute("SELECT data, slkk FROM items WHERE id=?", (int(rid),)).fetchone()
-            if cur is None:
-                continue
-            data, slkk_val, dirty = json.loads(cur["data"]), cur["slkk"], False
-
-            new_s, old_s = norm(new["SLKK"]), norm(old["SLKK"])
-            if new_s != old_s:
-                if cur["slkk"] != old_s:
-                    conflicts += 1
-                c.execute(
-                    "INSERT INTO log(ts,user,ip,sheet,item_id,col,old,new) VALUES (?,?,?,?,?,?,?,?)",
-                    (ts, user, ip, sheet, int(rid), "SLKK", str(cur["slkk"]), str(new_s)),
-                )
-                slkk_val, dirty = (None if new_s is None else float(new_s)), True
-
-            if is_admin:
-                for col in data_cols:
-                    if norm(new[col]) != norm(old[col]):
-                        c.execute(
-                            "INSERT INTO log(ts,user,ip,sheet,item_id,col,old,new) VALUES (?,?,?,?,?,?,?,?)",
-                            (ts, user, ip, sheet, int(rid), col, str(old[col]), str(new[col])),
-                        )
-                        data[col] = norm(new[col])
-                        dirty = True
-
-            if dirty:
-                c.execute(
-                    "UPDATE items SET data=?, slkk=?, updated_by=?, ip=?, updated_at=? WHERE id=?",
-                    (json.dumps(data, ensure_ascii=False), slkk_val, user, ip, ts, int(rid)),
-                )
-                changed += 1
-    return changed, conflicts
-
-
-def build_xlsx():
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        for s in list_sheets():
-            df, _ = load_df(s)
-            df.reset_index(drop=True).to_excel(w, index=False, sheet_name=s[:31])
-    return out.getvalue()
-
-
-def build_log_csv():
-    with db() as c:
-        df = pd.read_sql_query("SELECT * FROM log ORDER BY id DESC", c)
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-
-# ───────────────────────── UI ─────────────────────────
-init_app()
-st.session_state.setdefault("ver", 0)
-
-st.title("📋 HỆ THỐNG KIỂM KÊ KHO")
-st.markdown("---")
-
-with st.sidebar:
-    st.header("👤 THÔNG TIN NGƯỜI DÙNG")
-    user_name = st.text_input("Nhập họ tên của bạn:", placeholder="VD: Nguyễn Thị Trang").strip()
-
-    st.markdown("---")
-    st.header("🔐 VAI TRÒ")
-    role = st.selectbox("Chọn vai trò:", ["Nhân viên kho (Chỉ nhập SLKK)", "Quản trị viên (Admin)"])
-    is_admin = False
-    if role.startswith("Quản trị"):
-        expected = get_secret("ADMIN_PASSWORD")
-        pw = st.text_input("Mật khẩu Admin:", type="password")
-        if not expected:
-            st.error("Chưa cấu hình ADMIN_PASSWORD trong secrets.")
-        elif pw:
-            if hmac.compare_digest(pw.encode(), expected.encode()):
-                is_admin = True
-            else:
-                st.error("Sai mật khẩu.")
-
-    if is_admin:
-        st.markdown("---")
-        st.header("⚙️ QUẢN LÝ HỆ THỐNG")
-        if st.button("🔄 Nạp lại dữ liệu từ file Excel gốc"):
-            if os.path.exists(DB_FILE):
-                os.remove(DB_FILE)
-            init_app()
-            st.session_state["ver"] += 1
-            st.success("Đã làm mới dữ liệu từ file KK_List.xlsx trên GitHub!")
-            st.rerun()
-
-        if st.button("☁️ Sao lưu dữ liệu lên GitHub ngay"):
-            ok, msg = backup_to_github()
-            st.success("Đã sao lưu.") if ok else st.error(msg)
-
-        st.download_button(
-            "📜 Tải nhật ký chỉnh sửa (CSV)", build_log_csv(), "nhat_ky_chinh_sua.csv", "text/csv"
-        )
-
-sheets = list_sheets()
-if not sheets:
-    st.warning("⚠️ Chưa có dữ liệu. Hãy đảm bảo file `KK_List.xlsx` đã được tải lên kho lưu trữ GitHub của bạn.")
-    st.stop()
-
-if is_admin:
-    st.success("👑 Chế độ **Quản trị viên**: được sửa tất cả các cột dữ liệu.")
-else:
-    st.info("💡 Nhập họ tên (thanh bên trái) → chọn Section Name → Nhóm → nhập **SLKK** → bấm **LƯU**.")
-
-section_map = {sec: {} for sec in SECTION_NAMES}
-for s in sheets:
-    sec = get_section_name(s)
-    nhom = get_nhom_name(s)
-    if nhom not in section_map[sec]:
-        section_map[sec][nhom] = []
-    section_map[sec][nhom].append(s)
-
-available_sections = [sec for sec, nhoms in section_map.items() if nhoms]
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    section_name = st.selectbox("📂 Section Name:", available_sections)
-with c2:
-    available_nhoms = list(section_map[section_name].keys())
-    nhom_choice = st.selectbox("📋 Nhóm:", available_nhoms)
-with c3:
-    sheet_choices = section_map[section_name][nhom_choice]
-    if len(sheet_choices) > 1:
-        sheet = st.selectbox("📌 Sheet chi tiết:", sheet_choices)
-    else:
-        sheet = sheet_choices[0]
-        st.text_input("📌 Sheet chi tiết:", value=sheet, disabled=True)
-
-full_df, data_cols = load_df(sheet)
-done = int(full_df["SLKK"].notna().sum())
-st.caption(f"Đã nhập SLKK: **{done} / {len(full_df)}** dòng trong sheet này.")
-
-view = full_df
-f1, f2 = st.columns(2)
-with f1:
-    s_loc = st.text_input("🔍 Lọc theo Location:", key="filter_loc")
-    if s_loc and "location" in view.columns:
-        view = view[view["location"].astype(str).str.contains(s_loc, case=False, na=False)]
-with f2:
-    s_mat = st.text_input("🔍 Lọc theo Mã vật tư:", key="filter_mat")
-    if s_mat and "material_no" in view.columns:
-        view = view[view["material_no"].astype(str).str.contains(s_mat, case=False, na=False)]
-
-locked = META_COLS if is_admin else [c for c in view.columns if c != "SLKK"]
-original = view.copy()
-
-with st.form(key=f"form_{sheet}"):
-    edited = st.data_editor(
-        view,
-        disabled=locked,
-        hide_index=True,
-        use_container_width=True,
-        height=500,
-        column_config={"SLKK": st.column_config.NumberColumn("SLKK", min_value=0)},
-        key=f"editor_{sheet}_{s_loc}_{s_mat}_{st.session_state['ver']}",
-    )
-    submitted = st.form_submit_button(f"💾 LƯU THAY ĐỔI ({sheet})", type="primary", use_container_width=True)
-
-if submitted:
-    if not user_name:
-        st.warning("⚠️ Vui lòng nhập **Họ tên** ở thanh bên trái trước khi lưu!")
-    else:
-        changed, conflicts = save_changes(
-            sheet, original, edited, data_cols, user_name, get_client_ip(), is_admin
-        )
-        if changed:
-            ok, msg = backup_to_github()
-            st.session_state["ver"] += 1
-            st.success(f"🎉 Đã lưu {changed} dòng của **{user_name}** lên hệ thống & GitHub thành công!")
-            if conflicts:
-                st.warning(f"⚠️ {conflicts} dòng đã được người khác sửa trong lúc bạn nhập.")
-            if not ok:
-                st.warning(f"Lỗi sao lưu GitHub: {msg}")
-        else:
-            st.info("ℹ️ Không có thay đổi mới nào.")
-
-st.markdown("---")
-st.subheader("💾 TẢI XUỐNG KẾT QUẢ")
-if st.button("Chuẩn bị file Excel"):
-    st.session_state["xlsx"] = build_xlsx()
-if "xlsx" in st.session_state:
-    st.download_button(
-        "📥 Tải file Excel (kèm Tên, IP, Thời gian)",
-        st.session_state["xlsx"],
-        "KetQua_KiemKe_Audit.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
+    if st.button("🚀 Bắt đầu đọc và ghép dữ liệu", type="primary"):
+        with st.spinner("AI đang xử lý các ảnh, giữ nguyên dòng trống và trích xuất dữ liệu..."):
+            try:
+                api_key = st.secrets["GEMINI_API_KEY"]
+                genai.configure(api_key=api_key)
+                
+                # Sử dụng gemini-1.5-flash hỗ trợ đa ảnh xuất sắc
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                
+                # Chuẩn bị danh sách nội dung gửi cho AI (gồm các ảnh đã cắt)
+                contents = [
+                    "Bạn là trợ lý kiểm kê kho chuyên nghiệp. Hãy đọc các ảnh phiếu kiểm kê được cung cấp dưới đây.\n"
+                    "YÊU CẦU QUAN TRỌNG:\n"
+                    "1. Chỉ tập trung vào 2 cột: Mã vật tư và Số lượng kiểm kê (SLKK).\n"
+                    "2. Phải đọc tuần tự từng dòng từ trên xuống dưới, TUYỆT ĐỐI KHÔNG BỎ QUA các dòng trống hoặc dòng không ghi số lượng. Nếu dòng trống, hãy để giá trị slkk là null hoặc chuỗi rỗng để giữ nguyên thứ tự dòng.\n"
+                    "3. Trả về kết quả dưới dạng một danh sách JSON thuần túy (JSON array) với định dạng chuẩn:\n"
+                    '[{"material_no": "Mã vật tư tương ứng", "slkk": "Số lượng đếm được hoặc trống"}]'
+                ]
+                
+                for file in uploaded_files:
+                    c_bytes = crop_image_columns(file.getvalue(), col_left, col_top, col_right, col_bottom)
+                    contents.append({"mime_type": "image/jpeg", "data": c_bytes})
+                
+                response = model.generate_content(contents)
+                
+                # Làm sạch chuỗi JSON trả về từ AI
+                raw_text = response.text.strip()
+                if "```json" in raw_text:
+                    raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in raw_text:
+                    raw_text = raw_text.split("```")[1].split("```")[0].strip()
+                
+                data_list = json.loads(raw_text)
+                df_result = pd.DataFrame(data_list)
+                
+                st.success("✅ Trích xuất và ghép dữ liệu thành công!")
+                st.dataframe(df_result, use_container_width=True)
+                
+                # Lưu vào session_state để chuẩn bị map ngược lại vào hệ thống kho chính
+                st.session_state['scanned_result'] = df_result
+                
+            except Exception as e:
+                st.error(f"Lỗi trong quá trình xử lý: {e}")
